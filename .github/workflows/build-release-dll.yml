@@ -1,0 +1,154 @@
+# Modified from code generated with Google Gemini 3.1 Pro
+
+name: Build and Release libcurl Windows DLL (Static CRT /MT)
+
+on:
+  schedule:
+    - cron: '0 0 * * 3' # 00:00 UTC every Wednesday (0=Sun, 1=Mon, 2=Tue, 3=Wed)
+  workflow_dispatch:
+
+jobs:
+  check-and-build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Update vcpkg and Determine curl Version
+        id: vcpkg_info
+        shell: pwsh
+        run: |
+          $vcpkg_dir = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkg_dir) { $vcpkg_dir = "C:\vcpkg" }
+          cd $vcpkg_dir
+          
+          git pull origin master
+          .\bootstrap-vcpkg.bat
+          
+          $curl_json_path = "$vcpkg_dir\ports\curl\vcpkg.json"
+          $curl_json = Get-Content $curl_json_path | ConvertFrom-Json
+          $curl_version = $curl_json.version
+          
+          echo "CURL_VERSION=$curl_version" >> $env:GITHUB_ENV
+          echo "CURL_TAG=v$curl_version" >> $env:GITHUB_ENV
+          echo "VCPKG_DIR=$vcpkg_dir" >> $env:GITHUB_ENV
+          Write-Output "Detected curl version: $curl_version"
+
+      - name: Check if Release Already Exists
+        id: check_release
+        shell: pwsh
+        run: |
+          $repo = "${{ github.repository }}"
+          $tag = $env:CURL_TAG
+          $headers = @{
+            Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"
+          }
+          try {
+            Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag" -Headers $headers -ErrorAction Stop
+            Write-Output "Release $tag already exists. Skipping build."
+            echo "SKIP_BUILD=true" >> $env:GITHUB_ENV
+          } catch {
+            Write-Output "Release $tag does not exist. Proceeding with build."
+            echo "SKIP_BUILD=false" >> $env:GITHUB_ENV
+          }
+
+      - name: Create Custom Triplets for Standalone DLL
+        if: env.SKIP_BUILD == 'false'
+        shell: pwsh
+        run: |
+          $triplets_dir = "$env:GITHUB_WORKSPACE\custom-triplets"
+          New-Item -ItemType Directory -Force -Path $triplets_dir | Out-Null
+          echo "TRIPLETS_DIR=$triplets_dir" >> $env:GITHUB_ENV
+          
+          $architectures = @("x86", "x64", "arm64")
+          
+          foreach ($arch in $architectures) {
+            # Default to static for zlib/openssl, override to dynamic for curl
+            $triplet_content = @"
+          set(VCPKG_TARGET_ARCHITECTURE $arch)
+          set(VCPKG_CRT_LINKAGE static)
+          set(VCPKG_LIBRARY_LINKAGE static)
+          
+          if(PORT STREQUAL "curl")
+              set(VCPKG_LIBRARY_LINKAGE dynamic)
+          endif()
+
+          set(VCPKG_CXX_FLAGS "${VCPKG_CXX_FLAGS} /guard:cf")
+          set(VCPKG_C_FLAGS "${VCPKG_C_FLAGS} /guard:cf")
+          set(VCPKG_LINKER_FLAGS "${VCPKG_LINKER_FLAGS} /guard:cf")
+
+          # Enabling the below flags causes libcurl to BEX64 at runtime
+          #if(VCPKG_TARGET_ARCHITECTURE STREQUAL arm64)
+          #  set(VCPKG_CXX_FLAGS "${VCPKG_CXX_FLAGS} /guard:ehcont /guard:signret")
+          #  set(VCPKG_C_FLAGS "${VCPKG_C_FLAGS} /guard:ehcont /guard:signret")
+          #  set(VCPKG_LINKER_FLAGS "${VCPKG_LINKER_FLAGS} /guard:ehcont /guard:delayloadsignret")
+          #endif()
+          #if(VCPKG_TARGET_ARCHITECTURE STREQUAL x64)
+          #  set(VCPKG_CXX_FLAGS "${VCPKG_CXX_FLAGS} /guard:ehcont")
+          #  set(VCPKG_C_FLAGS "${VCPKG_C_FLAGS} /guard:ehcont")
+          #  set(VCPKG_LINKER_FLAGS "${VCPKG_LINKER_FLAGS} /guard:ehcont /CETCOMPAT")
+          #endif()
+          #if(VCPKG_TARGET_ARCHITECTURE STREQUAL x86)
+          #  set(VCPKG_LINKER_FLAGS "${VCPKG_LINKER_FLAGS} /CETCOMPAT")
+          #endif()
+          "@
+            $triplet_path = "$triplets_dir\$arch-windows-standalone.cmake"
+            $triplet_content | Out-File -FilePath $triplet_path -Encoding utf8
+          }
+
+      - name: Build libcurl with Custom Triplets
+        if: env.SKIP_BUILD == 'false'
+        shell: pwsh
+        run: |
+          cd $env:VCPKG_DIR
+          .\vcpkg.exe install curl:x86-windows-standalone curl:x64-windows-standalone curl:arm64-windows-standalone --overlay-triplets="$env:TRIPLETS_DIR"
+
+      - name: Package Artifacts
+        if: env.SKIP_BUILD == 'false'
+        shell: pwsh
+        run: |
+          $vcpkg_dir = $env:VCPKG_DIR
+          $base_archs = @("x86", "x64", "arm64")
+          
+          # Create a master staging directory for the zip file contents
+          $staging_dir = "staging"
+          New-Item -ItemType Directory -Force -Path $staging_dir | Out-Null
+          
+          foreach ($arch in $base_archs) {
+            # Map back to the custom vcpkg triplet name
+            $vcpkg_triplet = "$arch-windows-standalone"
+            
+            # Create the requested $arch\Release structure
+            if ($arch -eq "x86") {
+              $arch = "Win32"
+            }
+            if ($arch -eq "arm64") {
+              $arch = "ARM64"
+            }
+            $target_dir = "$staging_dir\$arch\Release"
+            New-Item -ItemType Directory -Force -Path $target_dir | Out-Null
+            
+            # Copy all DLLs (libcurl.dll + runtime dependencies like zlib1.dll) into the Release folder
+            if (Test-Path "$vcpkg_dir\installed\$vcpkg_triplet\bin\*.dll") {
+              Copy-Item -Path "$vcpkg_dir\installed\$vcpkg_triplet\bin\*.dll" -Destination "$target_dir\" -Force
+            }
+          }
+          
+          # Compress the contents of the staging folder into a single libcurl.zip
+          Compress-Archive -Path "$staging_dir\*" -DestinationPath "libcurl.zip" -Force
+
+      - name: Create GitHub Release
+        if: env.SKIP_BUILD == 'false'
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ env.CURL_TAG }}
+          name: "libcurl ${{ env.CURL_VERSION }} (Static CRT /MT)"
+          body: |
+            Automated build of `libcurl` version **${{ env.CURL_VERSION }}** using vcpkg.
+            
+            Compiled as completely standalone **Dynamic Libraries (.dll)** with the **Static C Runtime (`/MT`)**.
+            Includes `libcurl.dll` formatted in a `$arch\Release\` directory structure.
+          files: libcurl.zip
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
