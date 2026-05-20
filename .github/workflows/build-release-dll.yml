@@ -129,7 +129,7 @@ jobs:
             $target_dir = "$staging_dir\$arch\Release"
             New-Item -ItemType Directory -Force -Path $target_dir | Out-Null
             
-            # Copy all DLLs (libcurl.dll + runtime dependencies like zlib1.dll) into the Release folder
+            # Copy all DLLs (only libcurl.dll since we are building standalone) into the Release folder
             if (Test-Path "$vcpkg_dir\installed\$vcpkg_triplet\bin\*.dll") {
               Copy-Item -Path "$vcpkg_dir\installed\$vcpkg_triplet\bin\*.dll" -Destination "$target_dir\" -Force
             }
